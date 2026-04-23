@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SENA Practice — Voice Assistant</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <main class="shell">
+      <header class="hero">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <div>
+            <p class="eyebrow">SENA Health</p>
+            <h1>Practice reception assistant</h1>
+          </div>
+        </div>
+        <p class="lede">
+          Speak naturally to book or reschedule a visit. The assistant asks for anything it is missing
+          and understands small corrections like &ldquo;actually, next Monday.&rdquo;
+        </p>
+        <div id="aiBanner" class="ai-banner hidden" role="status" aria-live="polite"></div>
+      </header>
+
+      <section class="panel chat-panel" aria-live="polite">
+        <div class="chat-head">
+          <h2>Conversation</h2>
+          <div class="chips" id="stateChips"></div>
+        </div>
+        <div class="transcript" id="transcript"></div>
+      </section>
+
+      <section class="panel controls">
+        <div class="input-row">
+          <button type="button" class="btn mic" id="micBtn" aria-pressed="false" title="Hold to speak">
+            <span class="mic-icon" aria-hidden="true"></span>
+            <span id="micLabel">Hold to talk</span>
+          </button>
+          <label class="sr-only" for="textInput">Type a message</label>
+          <input
+            id="textInput"
+            type="text"
+            autocomplete="off"
+            placeholder="Or type here: “Book an appointment for Alex next Tuesday afternoon”"
+          />
+          <button type="button" class="btn primary" id="sendBtn">Send</button>
+        </div>
+        <p class="hint" id="voiceHint">
+          Voice uses your browser (Chrome or Edge recommended). Allow microphone access when prompted.
+        </p>
+        <div class="toolbar">
+          <button type="button" class="btn ghost" id="resetBtn">Clear session</button>
+          <span class="status" id="statusLine">Connecting…</span>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+dateparser>=1.2,<2
+pydantic>=2.6,<3
+openai>=1.40,<2
+google-generativeai>=0.8,<1
