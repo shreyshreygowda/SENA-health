@@ -15,6 +15,7 @@ from app.llm import TurnAnalysis, fetch_turn_analysis, get_llm_runtime_status
 
 logger = logging.getLogger(__name__)
 
+# Main state machine for intake + booking/reschedule slot collection.
 
 class Intent(str, Enum):
     BOOK = "book"
@@ -85,6 +86,7 @@ class ConversationState:
     old_appointment_date: str | None = None
     transcript: list[dict[str, str]] = field(default_factory=list)
 
+    # Returns state fields used by the frontend status chips.
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "intent": self.intent.value if self.intent else None,
@@ -206,6 +208,8 @@ def _extract_name(text: str) -> str | None:
             name = m.group(1).strip()
             # Trim trailing filler words
             name = re.split(r"\b(and|for|on|at|the|a)\b", name, maxsplit=1, flags=re.I)[0].strip()
+            if _normalize(name) in _PLACEHOLDER_NAMES:
+                return None
             if 1 < len(name) < 60 and _name_tokens_plausible(name):
                 return name.title()
     return _fallback_name_from_line(raw)
@@ -262,8 +266,13 @@ _NAME_BLOCKLIST = frozenset(
         "hello",
         "thanks",
         "thank",
+        "today",
+        "tomorrow",
+        "tonight",
     }
 )
+
+_PLACEHOLDER_NAMES = frozenset({"john doe", "jane doe", "test user", "patient name"})
 
 
 def _fallback_name_from_line(text: str) -> str | None:
@@ -282,7 +291,10 @@ def _fallback_name_from_line(text: str) -> str | None:
             return None
     if not re.fullmatch(r"[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*)*", raw):
         return None
-    return raw.title()
+    candidate = raw.title()
+    if _normalize(candidate) in _PLACEHOLDER_NAMES:
+        return None
+    return candidate
 
 
 def _strip_leading_date_filler(text: str) -> str:
@@ -349,6 +361,103 @@ def _parse_ordinal_day_of_month(text: str, base: datetime) -> date | None:
         except ValueError:
             return None
     return candidate
+
+
+def _parse_standalone_ordinal_day(text: str, base: datetime) -> date | None:
+    """Phrases like 'the 25th' when month is implied by context."""
+    s = _normalize(text)
+    if re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
+        s,
+    ):
+        return None
+    if re.search(r"\b20\d{2}\b", s):
+        return None
+    m = re.search(r"(?i)\b(?:the\s+)?(\d{1,2})(st|nd|rd|th)\b(?!\s+of\b)", s)
+    if not m:
+        return None
+    day = int(m.group(1))
+    base_d = base.date() if isinstance(base, datetime) else base
+    year, month = base_d.year, base_d.month
+    try:
+        candidate = date(year, month, day)
+    except ValueError:
+        return None
+    if candidate < base_d:
+        year = year + 1 if month == 12 else year
+        month = 1 if month == 12 else month + 1
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return None
+    return candidate
+
+
+def _parse_nth_weekday_of_month(text: str, base: datetime) -> date | None:
+    """
+    Phrases like "first friday of may", "1st friday in may 2027",
+    or noisy variants such as "friday the 1st friday of may".
+    """
+    s = _normalize(text)
+    ord_map = {
+        "first": 1,
+        "1st": 1,
+        "second": 2,
+        "2nd": 2,
+        "third": 3,
+        "3rd": 3,
+        "fourth": 4,
+        "4th": 4,
+        "fifth": 5,
+        "5th": 5,
+    }
+    wd_map = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    month_alt = "|".join(sorted(_MONTH_NUM.keys(), key=len, reverse=True))
+    ord_alt = "|".join(sorted(ord_map.keys(), key=len, reverse=True))
+    wd_alt = "|".join(wd_map.keys())
+
+    m = re.search(
+        rf"(?i)\b({ord_alt})\s+({wd_alt})\s+(?:of|in)\s+({month_alt})\b(?:\s*,?\s*(\d{{4}}))?",
+        s,
+    )
+    if not m:
+        return None
+    nth = ord_map[m.group(1).lower()]
+    tgt_wd = wd_map[m.group(2).lower()]
+    month = _MONTH_NUM[m.group(3).lower()]
+    year_s = m.group(4)
+    base_d = base.date() if isinstance(base, datetime) else base
+    year = int(year_s) if year_s else base_d.year
+
+    def _candidate(y: int) -> date | None:
+        try:
+            first_day = date(y, month, 1)
+        except ValueError:
+            return None
+        delta = (tgt_wd - first_day.weekday()) % 7
+        day_num = 1 + delta + (nth - 1) * 7
+        try:
+            return date(y, month, day_num)
+        except ValueError:
+            return None
+
+    cand = _candidate(year)
+    if not cand:
+        return None
+    if not year_s and cand < base_d:
+        cand_next = _candidate(year + 1)
+        if cand_next:
+            return cand_next
+    return cand
 
 
 def _parse_month_name_date(text: str, base: datetime) -> date | None:
@@ -422,9 +531,21 @@ def _parse_one_date_chunk(chunk: str, ref: datetime) -> str | None:
             break
 
     cleaned = _strip_leading_date_filler(raw)
+    cleaned = re.sub(r"(?i)\b(today|tomorrow|tonight|yesterday)'s\b", r"\1", cleaned)
+    rel_word = _embedded_relative_day_word(cleaned)
+    if rel_word:
+        rel_dt = dateparser.parse(rel_word, settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": ref})
+        if rel_dt:
+            return rel_dt.date().isoformat()
+    nth_weekday = _parse_nth_weekday_of_month(cleaned, ref)
+    if nth_weekday:
+        return nth_weekday.isoformat()
     od = _parse_ordinal_day_of_month(cleaned, ref)
     if od:
         return od.isoformat()
+    od_standalone = _parse_standalone_ordinal_day(cleaned, ref)
+    if od_standalone:
+        return od_standalone.isoformat()
     explicit = _parse_month_name_date(cleaned, ref)
     if explicit:
         return explicit.isoformat()
@@ -457,9 +578,10 @@ def _parse_date_from_text(text: str, base: datetime | None = None) -> str | None
 
 def _parse_time_from_text(text: str) -> str | None:
     t = _normalize(text)
-    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t)
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b", t)
     if m:
-        h, minute, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        h, minute = int(m.group(1)), int(m.group(2) or 0)
+        ap = m.group(3).replace(".", "").lower()
         if ap == "pm" and h != 12:
             h += 12
         if ap == "am" and h == 12:
@@ -511,9 +633,10 @@ def _parse_time_from_utterance(text: str) -> str | None:
                 h = int(m.group(1))
                 if 1 <= h <= 11:
                     return f"{h:02d}:00"
-        m = re.search(r"(?:^|\s)(?:do\s+)?(\d{1,2})\s*(am|pm)\s*$", t)
+        m = re.search(r"(?:^|\s)(?:do\s+)?(\d{1,2})\s*(a\.?m\.?|p\.?m\.?)\s*$", t)
         if m:
-            h, ap = int(m.group(1)), m.group(2).lower()
+            h = int(m.group(1))
+            ap = m.group(2).replace(".", "").lower()
             if ap == "pm" and h != 12:
                 h += 12
             if ap == "am" and h == 12:
@@ -590,11 +713,26 @@ def _coerce_time(value: str | None) -> str | None:
     return f"{h:02d}:{mi:02d}"
 
 
-def _llm_patient_name(hint: TurnAnalysis | None) -> str | None:
+def _utterance_has_name_signal(text: str) -> bool:
+    t = _normalize(text)
+    return bool(
+        re.search(
+            r"\b(my name is|i am|i'm|this is|call me|name is|for|under the name)\b",
+            t,
+        )
+    )
+
+
+def _llm_patient_name(text: str, hint: TurnAnalysis | None) -> str | None:
     if not hint or not hint.patient_name:
+        return None
+    # Prevent placeholder hallucinations when caller did not provide a name.
+    if not _utterance_has_name_signal(text):
         return None
     n = hint.patient_name.strip()
     if len(n) < 2 or len(n) > 60 or re.search(r"\d{3,}", n):
+        return None
+    if _normalize(n) in _PLACEHOLDER_NAMES:
         return None
     if not _name_tokens_plausible(n):
         return None
@@ -639,6 +777,28 @@ def classify_intent(text: str) -> Intent:
     return Intent.GENERAL
 
 
+def _looks_like_scheduling_ask(text: str) -> bool:
+    t = _normalize(text)
+    return bool(
+        re.search(
+            r"\b(book|schedule|reschedule|appointment|visit|move|change|cancel|slot|availability|"
+            r"next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|tomorrow|today|"
+            r"morning|afternoon|evening|\d{1,2}\s*(?::\d{2})?\s*(a\.?m\.?|p\.?m\.?))\b",
+            t,
+        )
+    )
+
+
+def _is_scheduling_abort(text: str) -> bool:
+    t = _normalize(text)
+    return bool(
+        re.search(
+            r"\b(never mind|nevermind|forget it|stop|don'?t want to|do not want to|not anymore)\b",
+            t,
+        )
+    )
+
+
 _DOCTOR_FAQ_REPLY = (
     "I can't see your chart from this line. Your appointment confirmation or patient portal lists the "
     "provider, or the front desk can look it up when you arrive."
@@ -656,6 +816,35 @@ def _is_doctor_faq(text: str) -> bool:
 
 
 GENERAL_RESPONSES: list[tuple[str, str]] = [
+    (
+        r"feel sick|i'?m sick|im sick|nausea|nauseous|fever|vomit|throwing up|dizzy|not feeling well|"
+        r"what should i do",
+        "I'm sorry you're not feeling well. If symptoms are severe or getting worse, call 911 right now. "
+        "If it is not an emergency, I can help book the earliest available appointment today or tomorrow.",
+    ),
+    (
+        r"i don'?t know what to do|i dont know what to do|not sure what to do|confused what to do",
+        "If this feels urgent or severe, call 911 now. If it is not an emergency, I can help you book the "
+        "soonest appointment and connect you with the care team.",
+    ),
+    (
+        r"will there be other patients|only patient|crowded|busy|wait time|waiting room",
+        "There may be other patients in the clinic. Arriving about 10 to 15 minutes early usually helps "
+        "check-in go smoothly.",
+    ),
+    (
+        r"don'?t want to cancel|do not want to cancel|not cancel anymore|don't think i want to cancel|"
+        r"i dont want to cancel|never mind cancel",
+        "No problem. We can leave your current appointment as is. I can also help with any other questions.",
+    ),
+    (
+        r"\bcancel\b|cancel my appointment|need to cancel|call off my appointment",
+        "I can help cancel your appointment. Please share the patient name and the appointment date to cancel.",
+    ),
+    (
+        r"thanks so much|thank you so much|thanks a lot|tysm",
+        "You're very welcome. Happy to help.",
+    ),
     (
         r"what doctor|which doctor|who (am i|will i) see|who is my doctor|what physician|"
         r"provider (for|am i)|doctor am i|what doctor.*(see|seeing)|which doctor.*(see|seeing)",
@@ -702,9 +891,25 @@ def general_reply(text: str) -> str:
     return match_canned_general(text) or _GENERAL_FALLBACK
 
 
+def _is_emergency_like_text(text: str) -> bool:
+    return bool(re.search(r"(?i)\b(emergency|urgent|severe pain|chest pain|can'?t breathe|cant breathe)\b", text))
+
+
+def _is_priority_office_faq(text: str) -> bool:
+    t = _normalize(text)
+    return bool(
+        re.search(
+            r"\b(who is my doctor|which doctor|what doctor|physician|other patients|only patient|wait time|"
+            r"insurance|coverage|no insurance|can't afford|cannot afford|broke)\b",
+            t,
+        )
+    )
+
+
 class ConversationEngine:
     """Multi-turn slot filling with correction handling."""
 
+    # Sets up a fresh conversation with optional logging and LLM assist.
     def __init__(self, log_path: Path | None = None, enable_llm: bool | None = None) -> None:
         self.state = ConversationState()
         self.log_path = log_path
@@ -714,6 +919,7 @@ class ConversationEngine:
             enable_llm = llm_enabled()
         self.enable_llm = enable_llm
 
+    # Builds the minimal context sent to the LLM for one turn.
     def _llm_context(self) -> dict[str, Any]:
         return {
             "phase": self.state.phase.value,
@@ -726,14 +932,17 @@ class ConversationEngine:
             "today_utc": datetime.now(UTC).date().isoformat(),
         }
 
+    # Pulls appointment date from user text first, then safe LLM hint fallback.
     def _date_from_text_or_llm(self, text: str, hint: TurnAnalysis | None) -> str | None:
         d = _parse_date_from_text(text)
         if d:
             return d
-        if hint and hint.appointment_date:
+        # only trust LLM date hints when the user actually gave date-like wording
+        if hint and hint.appointment_date and _utterance_has_date_signal(text):
             return _coerce_iso_date(hint.appointment_date)
         return None
 
+    # Extracts a date from longer booking phrases with filler words.
     def _date_from_chatty_booking_line(self, text: str, hint: TurnAnalysis | None) -> str | None:
         """Pick up 'tomorrow' etc. after filler like 'book an appointment for …'."""
         d = self._date_from_text_or_llm(text, hint)
@@ -749,25 +958,29 @@ class ConversationEngine:
             return self._date_from_text_or_llm(m.group(1).strip(), hint)
         return None
 
+    # Reads the old appointment date for reschedule flow.
     def _old_date_from_text_or_llm(self, text: str, hint: TurnAnalysis | None) -> str | None:
         d = _parse_date_from_text(text)
         if d:
             return d
-        if hint and hint.old_appointment_date:
+        if hint and hint.old_appointment_date and _utterance_has_date_signal(text):
             return _coerce_iso_date(hint.old_appointment_date)
         return None
 
+    # Reads appointment time from text with optional safe LLM fallback.
     def _time_from_text_or_llm(self, text: str, hint: TurnAnalysis | None) -> str | None:
         tm = _parse_time_from_utterance(text)
         if tm:
             return tm
-        if hint and hint.appointment_time:
+        if hint and hint.appointment_time and _utterance_has_time_signal(text):
             return _coerce_time(hint.appointment_time)
         return None
 
+    # Clears conversation state for a new caller/session.
     def reset(self) -> None:
         self.state = ConversationState()
 
+    # Appends one turn to in-memory transcript and optional jsonl log.
     def _log_turn(self, role: str, content: str) -> None:
         self.state.transcript.append(
             {"role": role, "content": content, "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z")}
@@ -778,6 +991,7 @@ class ConversationEngine:
             with self.log_path.open("a", encoding="utf-8") as f:
                 f.write(line)
 
+    # Finalizes booking response and writes structured final result log.
     def _finalize_booking(self) -> str:
         record = {
             "action": "BOOKED",
@@ -794,6 +1008,7 @@ class ConversationEngine:
         self.state.phase = Phase.DONE
         return msg
 
+    # Finalizes reschedule response and writes structured final result log.
     def _finalize_reschedule(self) -> str:
         record = {
             "action": "RESCHEDULED",
@@ -812,6 +1027,7 @@ class ConversationEngine:
         self.state.phase = Phase.DONE
         return msg
 
+    # Main entry point: runs one message through analysis, flow logic, and payload formatting.
     def process_message(self, user_text: str) -> tuple[str, dict[str, Any]]:
         text = user_text.strip()
         if not text:
@@ -837,11 +1053,14 @@ class ConversationEngine:
         payload["ai_status"] = get_llm_runtime_status()
         return reply, payload
 
+    # Routes each turn based on current phase/intent and decides next action.
     def _step(self, text: str, hint: TurnAnalysis | None = None) -> tuple[str, bool]:
         s = self.state
 
-        # Silence / unclear very short
-        if len(text) < 2:
+        # Silence / unclear very short; allow single-token time replies like "4" in time collection.
+        if len(text) < 2 and not (
+            s.phase == Phase.COLLECT_TIME and re.fullmatch(r"\d{1,2}", text.strip())
+        ):
             return "I didn't quite understand. Could you say that again?", False
 
         # Fresh start after done
@@ -849,13 +1068,20 @@ class ConversationEngine:
             self.reset()
             s = self.state
 
+        if s.phase not in (Phase.IDLE, Phase.DONE) and _is_scheduling_abort(text):
+            self.reset()
+            return (
+                "No problem - we can pause scheduling. Ask me anything, or say book/reschedule when you're ready.",
+                True,
+            )
+
         if s.phase == Phase.IDLE:
             rule_intent = classify_intent(text)
             if rule_intent != Intent.GENERAL:
                 s.intent = rule_intent
             elif hint:
                 si = (hint.scheduling_intent or "").lower()
-                if si in ("book", "reschedule"):
+                if si in ("book", "reschedule") and _looks_like_scheduling_ask(text):
                     s.intent = Intent.BOOK if si == "book" else Intent.RESCHEDULE
                 else:
                     s.intent = Intent.GENERAL
@@ -863,15 +1089,21 @@ class ConversationEngine:
                 s.intent = Intent.GENERAL
 
             if s.intent == Intent.GENERAL:
+                if _is_emergency_like_text(text):
+                    canned = match_canned_general(text)
+                    if canned:
+                        return canned, True
+                if _is_doctor_faq(text):
+                    return _DOCTOR_FAQ_REPLY, True
+                if hint and hint.general_reply and hint.general_reply.strip():
+                    return hint.general_reply.strip(), True
                 canned = match_canned_general(text)
                 if canned:
                     return canned, True
-                if hint and hint.general_reply and hint.general_reply.strip():
-                    return hint.general_reply.strip(), True
                 return general_reply(text), True
             if s.intent == Intent.BOOK:
                 s.phase = Phase.COLLECT_NAME
-                name = _extract_name(text) or _llm_patient_name(hint)
+                name = _extract_name(text) or _llm_patient_name(text, hint)
                 d0 = self._date_from_chatty_booking_line(text, hint)
                 if name:
                     s.patient_name = name
@@ -896,7 +1128,7 @@ class ConversationEngine:
 
             # RESCHEDULE
             s.phase = Phase.COLLECT_NAME
-            name = _extract_name(text) or _llm_patient_name(hint)
+            name = _extract_name(text) or _llm_patient_name(text, hint)
             if name:
                 s.patient_name = name
                 s.phase = Phase.COLLECT_OLD_DATE
@@ -904,6 +1136,8 @@ class ConversationEngine:
             return "I can reschedule that. Who is the appointment for?", False
 
         if s.phase not in (Phase.IDLE, Phase.DONE) and s.intent in (Intent.BOOK, Intent.RESCHEDULE):
+            if not _looks_like_scheduling_ask(text) and hint and hint.general_reply and hint.general_reply.strip():
+                return hint.general_reply.strip(), False
             if _is_doctor_faq(text):
                 return _DOCTOR_FAQ_REPLY, False
 
@@ -914,6 +1148,7 @@ class ConversationEngine:
             return self._flow_reschedule(text, hint)
         return general_reply(text), True
 
+    # Handles slot collection and corrections for the booking flow.
     def _flow_book(self, text: str, hint: TurnAnalysis | None = None) -> tuple[str, bool]:
         s = self.state
         if s.phase == Phase.COLLECT_NAME:
@@ -923,7 +1158,7 @@ class ConversationEngine:
                     s.appointment_date = dfix
                     s.phase = Phase.COLLECT_TIME
                     return f"Updated to {s.appointment_date}. What time should I hold?", False
-            name = _extract_name(text) or _llm_patient_name(hint)
+            name = _extract_name(text) or _llm_patient_name(text, hint)
             if not name or len(name) < 2:
                 return "Could you tell me the name again?", False
             s.patient_name = name
@@ -1004,10 +1239,11 @@ class ConversationEngine:
 
         return "Let's start over. How can I help?", True
 
+    # Handles slot collection and corrections for the reschedule flow.
     def _flow_reschedule(self, text: str, hint: TurnAnalysis | None = None) -> tuple[str, bool]:
         s = self.state
         if s.phase == Phase.COLLECT_NAME:
-            name = _extract_name(text) or _llm_patient_name(hint)
+            name = _extract_name(text) or _llm_patient_name(text, hint)
             if not name or len(name) < 2:
                 return "Who should I look up?", False
             s.patient_name = name

@@ -11,6 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 def main() -> None:
+    # Handy local loop for testing flows without opening the browser UI.
     log = Path(__file__).resolve().parent.parent / "logs" / "cli.jsonl"
     engine = ConversationEngine(log_path=log)
     print("SENA practice assistant (text mode). Commands: /reset /quit")

@@ -1,4 +1,4 @@
-"""Optional LLM assist: Google Gemini or OpenAI — structured extraction + general reception answers."""
+"""Optional Ollama assist for one-turn extraction and general replies."""
 
 from __future__ import annotations
 
@@ -6,12 +6,16 @@ import json
 import logging
 import os
 import re
-from typing import Any, Literal
+import time
+import urllib.error
+import urllib.request
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
+# Runtime status powers the small AI banner in the frontend.
 _runtime_status: dict[str, Any] = {
     "enabled": False,
     "provider": None,
@@ -21,6 +25,7 @@ _runtime_status: dict[str, Any] = {
     "last_error_message": None,
     "quota_exceeded": False,
 }
+_ollama_probe_cache: dict[str, Any] = {"ts": 0.0, "ok": False}
 
 
 class TurnAnalysis(BaseModel):
@@ -42,44 +47,79 @@ class TurnAnalysis(BaseModel):
     )
 
 
-def _openai_key() -> str | None:
-    k = os.environ.get("OPENAI_API_KEY", "").strip()
-    return k or None
+def _ollama_base_url() -> str:
+    # Returns base URL for local Ollama API.
+    return (os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").strip().rstrip("/")
 
 
-def _gemini_key() -> str | None:
-    k = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-    return k or None
+def _ollama_model() -> str:
+    # Returns the configured Ollama model name.
+    return (os.environ.get("OLLAMA_MODEL") or "llama3.2:3b").strip()
 
 
-def llm_provider() -> Literal["openai", "gemini"] | None:
-    """Default: Gemini if `GEMINI_API_KEY` / `GOOGLE_API_KEY` is set, else OpenAI. Override with `LLM_PROVIDER=openai` or `gemini`."""
+def _ollama_timeout_seconds() -> float:
+    # Parses request timeout with a safe minimum.
+    raw = (os.environ.get("OLLAMA_TIMEOUT_SECONDS") or "90").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 90.0
+    return max(5.0, value)
+
+
+def _ollama_keep_alive() -> str:
+    # Returns model keep-alive duration for faster repeat turns.
+    return (os.environ.get("OLLAMA_KEEP_ALIVE") or "30m").strip()
+
+
+def llm_provider() -> str | None:
+    # Resolves whether Ollama assist is on or intentionally disabled.
+    """We keep provider logic simple: this project uses Ollama only."""
     override = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
-    if override == "openai" and _openai_key():
-        return "openai"
-    if override == "gemini" and _gemini_key():
-        return "gemini"
-    if _gemini_key():
-        return "gemini"
-    if _openai_key():
-        return "openai"
-    return None
+    if override in ("none", "off", "disabled", "false", "0"):
+        return None
+    if override and override != "ollama":
+        logger.warning("Unsupported LLM_PROVIDER=%s (expected 'ollama' or disabled); using ollama", override)
+    return "ollama"
+
+
+def _ollama_available() -> bool:
+    # Quick health check so we can skip LLM calls when Ollama is down.
+    """Fast health probe to avoid long request timeouts when Ollama is down."""
+    now = time.time()
+    # tiny cache so we do not ping /api/tags on every single chat turn
+    if now - float(_ollama_probe_cache.get("ts", 0.0)) < 5.0:
+        return bool(_ollama_probe_cache.get("ok", False))
+    ok = False
+    try:
+        req = urllib.request.Request(f"{_ollama_base_url()}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            ok = 200 <= getattr(resp, "status", 0) < 300
+    except Exception:
+        ok = False
+    _ollama_probe_cache["ts"] = now
+    _ollama_probe_cache["ok"] = ok
+    return ok
 
 
 def llm_enabled() -> bool:
-    return llm_provider() is not None
+    # Indicates whether LLM assist should be used for this run.
+    p = llm_provider()
+    if p == "ollama":
+        return _ollama_available()
+    return p is not None
 
 
 def llm_model_label() -> str:
+    # Returns model label used in status endpoints/UI.
     p = llm_provider()
-    if p == "gemini":
-        return os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
-    if p == "openai":
-        return os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+    if p == "ollama":
+        return _ollama_model()
     return ""
 
 
 def get_llm_runtime_status() -> dict[str, Any]:
+    # Exposes runtime status consumed by frontend AI banner.
     p = llm_provider()
     m = llm_model_label() or None
     return {
@@ -94,6 +134,7 @@ def get_llm_runtime_status() -> dict[str, Any]:
 
 
 def _mark_llm_ok(provider: str, model: str) -> None:
+    # Stores last successful LLM call info.
     _runtime_status.update(
         {
             "enabled": True,
@@ -108,6 +149,7 @@ def _mark_llm_ok(provider: str, model: str) -> None:
 
 
 def _mark_llm_error(provider: str, model: str, err: Exception) -> None:
+    # Stores last LLM error info for UI visibility and fallback behavior.
     msg = str(err)
     code = getattr(err, "status_code", None)
     if code is None:
@@ -128,6 +170,7 @@ def _mark_llm_error(provider: str, model: str, err: Exception) -> None:
 
 
 def _strip_json_fence(raw: str) -> str:
+    # Removes markdown code fences around model JSON when present.
     t = raw.strip()
     if t.startswith("```"):
         t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
@@ -136,6 +179,7 @@ def _strip_json_fence(raw: str) -> str:
 
 
 def _system_prompt() -> str:
+    # Defines structured extraction contract for the turn-level LLM call.
     return (
         "You help a medical practice phone reception assistant. "
         "You never diagnose, prescribe, or give clinical advice. "
@@ -158,83 +202,58 @@ def _system_prompt() -> str:
 
 
 def _user_payload(state_snapshot: dict[str, Any], user_text: str) -> str:
+    # Serializes dialog state + caller message into one JSON payload.
     return json.dumps(
         {"dialog_state": state_snapshot, "caller_message": user_text},
         ensure_ascii=False,
     )
 
 
-def _fetch_openai(state_snapshot: dict[str, Any], user_text: str) -> TurnAnalysis | None:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        logger.warning("openai package not installed; cannot use OpenAI assist")
-        return None
-
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+def _fetch_ollama(state_snapshot: dict[str, Any], user_text: str) -> TurnAnalysis | None:
+    # Executes one non-streaming Ollama chat request and validates JSON response.
+    base = _ollama_base_url()
+    model = _ollama_model()
     system = _system_prompt()
     payload = _user_payload(state_snapshot, user_text)
+    timeout_s = _ollama_timeout_seconds()
 
+    body = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        # keep the model warm so responses stay fast in back-to-back turns
+        "keep_alive": _ollama_keep_alive(),
+        "options": {"temperature": 0.2},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": payload},
+        ],
+    }
+    req = urllib.request.Request(
+        f"{base}/api/chat",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        client = OpenAI()
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": payload},
-            ],
-        )
-        raw = resp.choices[0].message.content or "{}"
-        data = json.loads(_strip_json_fence(raw))
-        _mark_llm_ok("openai", model)
-        return TurnAnalysis.model_validate(data)
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+            obj = json.loads(raw)
+            content = (obj.get("message") or {}).get("content", "").strip()
+            if not content:
+                raise RuntimeError("Ollama returned empty message content")
+            data = json.loads(_strip_json_fence(content))
+            _mark_llm_ok("ollama", model)
+            return TurnAnalysis.model_validate(data)
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="ignore")
+        err = RuntimeError(f"{e.code} {msg[:300]}")
+        _mark_llm_error("ollama", model, err)
+        logger.warning("Ollama turn analysis failed: %s", err)
+        return None
     except Exception as e:
-        _mark_llm_error("openai", model, e)
-        logger.warning("OpenAI turn analysis failed: %s", e)
-        return None
-
-
-def _fetch_gemini(state_snapshot: dict[str, Any], user_text: str) -> TurnAnalysis | None:
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        logger.warning("google-generativeai not installed; cannot use Gemini assist")
-        return None
-
-    api_key = _gemini_key()
-    if not api_key:
-        return None
-
-    model_id = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
-    system = _system_prompt()
-    payload = _user_payload(state_snapshot, user_text)
-    combined = f"{system}\n\nRespond with JSON only, no other text.\n\n{payload}"
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_id,
-            generation_config={
-                "temperature": 0.2,
-                "response_mime_type": "application/json",
-            },
-        )
-        response = model.generate_content(combined)
-        raw = (getattr(response, "text", None) or "").strip()
-        if not raw and response.candidates:
-            parts = response.candidates[0].content.parts
-            raw = "".join(getattr(p, "text", "") or "" for p in parts).strip()
-        if not raw:
-            logger.warning("Gemini returned empty response")
-            return None
-        data = json.loads(_strip_json_fence(raw))
-        _mark_llm_ok("gemini", model_id)
-        return TurnAnalysis.model_validate(data)
-    except Exception as e:
-        _mark_llm_error("gemini", model_id, e)
-        logger.warning("Gemini turn analysis failed: %s", e)
+        _mark_llm_error("ollama", model, e)
+        logger.warning("Ollama turn analysis failed: %s", e)
         return None
 
 
@@ -242,9 +261,8 @@ def fetch_turn_analysis(
     state_snapshot: dict[str, Any],
     user_text: str,
 ) -> TurnAnalysis | None:
-    provider = llm_provider()
-    if provider == "gemini":
-        return _fetch_gemini(state_snapshot, user_text)
-    if provider == "openai":
-        return _fetch_openai(state_snapshot, user_text)
-    return None
+    # Public helper used by conversation engine to request structured turn hints.
+    # If someone disables LLM in env, we cleanly skip assist.
+    if llm_provider() is None:
+        return None
+    return _fetch_ollama(state_snapshot, user_text)

@@ -13,11 +13,13 @@ let sessionId = null;
 let recognition = null;
 let listening = false;
 
+// UI helper used across send/voice/reset flows.
 function setStatus(text, isError = false) {
   statusLine.textContent = text;
   statusLine.classList.toggle("error", isError);
 }
 
+// Shows AI availability/errors based on runtime status.
 function renderAiBanner(aiStatus) {
   if (!aiBanner) return;
   if (!aiStatus || !aiStatus.enabled) {
@@ -43,6 +45,7 @@ function renderAiBanner(aiStatus) {
   aiBanner.textContent = "";
 }
 
+// Adds a caller/assistant message bubble to transcript.
 function appendBubble(role, text) {
   const wrap = document.createElement("div");
   wrap.className = `bubble ${role}`;
@@ -56,6 +59,7 @@ function appendBubble(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
+// Renders current conversation state chips.
 function renderChips(state) {
   stateChips.innerHTML = "";
   const pairs = [
@@ -108,6 +112,7 @@ async function sendMessage(message) {
   speak(data.reply);
 }
 
+// Makes assistant reply audible using browser TTS.
 function speak(text) {
   if (!window.speechSynthesis) return;
   window.speechSynthesis.cancel();
@@ -121,6 +126,7 @@ function speak(text) {
   window.speechSynthesis.speak(u);
 }
 
+// Configures browser speech recognition handlers.
 function setupSpeechRecognition() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
@@ -169,6 +175,7 @@ function setupSpeechRecognition() {
   };
 }
 
+// Starts push-to-talk capture.
 function startListen() {
   if (!recognition) return;
   try {
@@ -183,6 +190,7 @@ function startListen() {
   }
 }
 
+// Stops push-to-talk capture.
 function stopListen() {
   if (!recognition) return;
   try {
@@ -242,7 +250,7 @@ window.speechSynthesis?.addEventListener("voiceschanged", () => {
     const fr = await fetch("/api/features");
     if (fr.ok) {
       const feat = await fr.json();
-      llmAssist = !!(feat.llm_configured ?? feat.openai_configured);
+      llmAssist = !!feat.llm_configured;
       if (feat.llm_provider && feat.llm_model) {
         llmLabel = `${feat.llm_provider} (${feat.llm_model})`;
       } else if (feat.llm_model) {

@@ -1,4 +1,5 @@
 :root {
+  /* Core tokens so color/spacing tweaks stay in one place. */
   color-scheme: light;
   --ink: #0f1b2e;
   --muted: #5a6a85;
