@@ -107,7 +107,7 @@ If Ollama is unavailable, the app falls back to rules. **`GET /api/features`** r
 - **Voice**: The browser **Web Speech API** handles speech-to-text and speech synthesis, so the demo runs without native audio drivers or cloud keys. The backend stays simple JSON over HTTP.
 - **Actions**: Booking and rescheduling **simulate** a practice system: the engine prints a structured `FINAL_RESULT` line and appends JSON lines to `logs/conversations.jsonl` for traceability.
 
-## API (for integrations)
+## API
 
 | Method | Path           | Body                                      | Notes                |
 | ------ | -------------- | ----------------------------------------- | -------------------- |
@@ -122,7 +122,3 @@ If Ollama is unavailable, the app falls back to rules. **`GET /api/features`** r
 pip install pytest
 pytest -q
 ```
-
-## Submission
-
-Send a repository link or archive to **poosthuizen@senahealth.com** as described in the challenge brief.
